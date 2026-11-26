@@ -33,18 +33,22 @@
   /* Phone */
   #phone { flex: 1; display: flex; flex-direction: column; padding: 20px; gap: 20px; }
   #answer {
-    flex: 1; display: flex; align-items: center; justify-content: center; text-align: center;
-    font-size: 28px; font-weight: 600; padding: 16px; border-radius: 16px; background: #1a1a1a;
+    flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    font-size: 19px; line-height: 1.4; padding: 16px; border-radius: 16px; background: #1a1a1a;
     word-break: break-word; min-height: 160px;
   }
-  #snapBtn { width: 100%; height: 34vh; font-size: 34px; border-radius: 24px; }
+  .line { padding: 6px 0; border-bottom: 1px solid #262626; }
+  .line:last-child { border-bottom: 0; }
+  .line.final { font-size: 26px; font-weight: 700; color: #7fd18b; padding-top: 12px; }
+  .line.msg { text-align: center; font-size: 24px; font-weight: 600; padding-top: 40px; border: 0; }
+  #snapBtn { width: 100%; height: 22vh; font-size: 34px; border-radius: 24px; flex-shrink: 0; }
   #snapBtn:disabled { background: #444; }
 
   /* iPad */
   #ipad { flex: 1; display: flex; flex-direction: column; padding: 16px; gap: 12px; }
   video { width: 100%; max-height: 70vh; background: #000; border-radius: 12px; object-fit: contain; }
   #lastShot { max-width: 220px; border-radius: 8px; }
-  #ipadAnswer { font-size: 20px; }
+  #ipadAnswer { font-size: 18px; line-height: 1.4; }
   .gear { position: fixed; top: 10px; right: 10px; background: #222; padding: 8px 12px; font-size: 14px; z-index: 5; }
 </style>
 </head>
@@ -84,7 +88,7 @@
 <!-- PHONE -->
 <div id="phone" class="hidden">
   <button class="gear secondary" data-settings>⚙︎</button>
-  <div id="answer">Ready</div>
+  <div id="answer"><div class="line msg">Ready</div></div>
   <div id="phoneStatus" class="small" style="text-align:center"></div>
   <button id="snapBtn">SNAP</button>
 </div>
@@ -113,6 +117,27 @@ const store = {
   set: (k, v) => localStorage.setItem('snapsolve_' + k, v),
 };
 const RELAY = 'https://ntfy.sh/';
+
+// Render a multi-line solution: one step per line, final "ANSWER:" line highlighted.
+function renderSolution(el, text, isMsg) {
+  el.replaceChildren();
+  const lines = isMsg ? [text] : text.split('\n').map(s => s.trim()).filter(Boolean);
+  for (const l of lines) {
+    const d = document.createElement('div');
+    d.className = 'line' + (isMsg ? ' msg' : /^ANSWER:/i.test(l) ? ' final' : '');
+    d.textContent = l;
+    el.appendChild(d);
+  }
+  el.scrollTop = 0;
+}
+
+// ntfy.sh turns messages over 4096 bytes into attachments, so keep under that.
+function fitBytes(s, max) {
+  const enc = new TextEncoder();
+  if (enc.encode(s).length <= max) return s;
+  while (enc.encode(s + '…').length > max) s = s.slice(0, -1);
+  return s + '…';
+}
 
 function randomCode() {
   const a = new Uint8Array(18);
@@ -182,13 +207,14 @@ function startPhone() {
   $('phone').classList.remove('hidden');
   let pending = null, timer = null;
 
-  const setAnswer = (t) => { $('answer').textContent = t; };
+  const setAnswer = (t) => renderSolution($('answer'), t, true);
+  const setSolution = (t) => renderSolution($('answer'), t, false);
   const done = () => { pending = null; clearTimeout(timer); $('snapBtn').disabled = false; };
 
   listen((m) => {
     if (!pending) return;
     if (m.startsWith('ack:' + pending)) setAnswer('Thinking…');
-    else if (m.startsWith('ans:' + pending + ':')) { setAnswer(m.slice(('ans:' + pending + ':').length)); done(); }
+    else if (m.startsWith('ans:' + pending + ':')) { setSolution(m.slice(('ans:' + pending + ':').length)); done(); }
     else if (m.startsWith('err:' + pending + ':')) { setAnswer('Error: ' + m.slice(('err:' + pending + ':').length)); done(); }
   }, (ok) => { $('phoneStatus').textContent = ok ? 'Connected' : 'Reconnecting…'; });
 
@@ -205,9 +231,18 @@ function startPhone() {
 
 // ---------- iPad ----------
 const SYSTEM = `You are looking at a photo of a question (homework, worksheet, screen, etc).
-Read the question carefully and solve it. Work through it briefly if needed.
-Your FINAL line must be exactly: ANSWER: <the final answer in one short line>
-If multiple questions are visible, answer the most prominent one. If there is no readable question, reply: ANSWER: No question found.`;
+Read the question carefully and solve it.
+Reply ONLY in this format, nothing before or after:
+1. <first step>
+2. <second step>
+...
+ANSWER: <the final answer>
+Rules:
+- One step or decision per line. Keep each line short (under ~15 words).
+- List every step needed, in order. Simple questions may need only one step.
+- Plain text only: no markdown, no bold, no LaTeX. Write math like x^2, sqrt(3), 3/4.
+- If multiple questions are visible, solve the most prominent one.
+- If there is no readable question, reply only: ANSWER: No question found.`;
 
 async function askClaude(base64jpeg) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -220,7 +255,7 @@ async function askClaude(base64jpeg) {
     },
     body: JSON.stringify({
       model: store.get('model') || 'claude-sonnet-5-5',
-      max_tokens: 4000,
+      max_tokens: 16000,
       system: SYSTEM,
       messages: [{
         role: 'user',
@@ -234,8 +269,12 @@ async function askClaude(base64jpeg) {
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
   const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-  const m = text.match(/ANSWER:\s*(.+)\s*$/i) || text.match(/ANSWER:\s*(.+)/i);
-  return (m ? m[1] : text.split('\n').filter(Boolean).pop() || '(empty)').trim().slice(0, 1000);
+  if (!text) return 'ANSWER: (empty reply)';
+  // Drop any preamble before the first numbered step / ANSWER line.
+  const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+  const start = lines.findIndex(l => /^(\d+[.)]|ANSWER:)/i.test(l));
+  const out = (start > 0 ? lines.slice(start) : lines).join('\n');
+  return fitBytes(out, 3800);
 }
 
 function startIpad() {
@@ -285,7 +324,7 @@ function startIpad() {
       status('Snapped. Asking Claude…');
       const img = capture();
       const ans = await askClaude(img);
-      $('ipadAnswer').textContent = ans;
+      renderSolution($('ipadAnswer'), ans, false);
       status('Done. Waiting for phone…');
       reply && await send('ans:' + id + ':' + ans);
     } catch (e) {
