@@ -41,7 +41,20 @@
   .line:last-child { border-bottom: 0; }
   .line.final { font-size: 26px; font-weight: 700; color: #7fd18b; padding-top: 12px; }
   .line.msg { text-align: center; font-size: 24px; font-weight: 600; padding-top: 40px; border: 0; }
-  #snapBtn { width: 100%; height: 22vh; font-size: 34px; border-radius: 24px; flex-shrink: 0; }
+  #snapBtn {
+    width: 100%; height: 22vh; font-size: 34px; border-radius: 24px; flex-shrink: 0;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+    transition: background .15s;
+  }
+  #snapBtn .hint { font-size: 13px; font-weight: 500; opacity: .75; }
+  #snapBtn.holding { background: #f0a020; }
+  #pagesBar {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: #2a2210; color: #f0c060; padding: 8px 8px 8px 14px; border-radius: 12px; font-weight: 600;
+  }
+  #pagesBar.hidden { display: none; }
+  #pagesBar button { padding: 8px 14px; font-size: 15px; }
   #snapBtn:disabled { background: #444; }
 
   /* iPad */
@@ -89,8 +102,12 @@
 <div id="phone" class="hidden">
   <button class="gear secondary" data-settings>⚙︎</button>
   <div id="answer"><div class="line msg">Ready</div></div>
+  <div id="pagesBar" class="hidden">
+    <span id="pagesCount"></span>
+    <button class="secondary" id="clearBtn">Clear</button>
+  </div>
   <div id="phoneStatus" class="small" style="text-align:center"></div>
-  <button id="snapBtn">SNAP</button>
+  <button id="snapBtn">SNAP<span class="hint">tap = solve · hold = add page</span></button>
 </div>
 
 <!-- IPAD -->
@@ -102,8 +119,10 @@
   <video id="video" playsinline muted autoplay></video>
   <div id="status"></div>
   <div class="row" style="margin-top:0">
-    <button class="secondary" id="testSnap">Test snap here</button>
+    <button class="secondary" id="testAdd">Add page here</button>
+    <button class="secondary" id="testSnap">Snap + solve here</button>
   </div>
+  <div id="heldThumbs" style="display:flex;gap:6px;flex-wrap:wrap"></div>
   <img id="lastShot" class="hidden" alt="">
   <div id="ipadAnswer"></div>
 </div>
@@ -205,32 +224,74 @@ document.querySelectorAll('[data-settings]').forEach(b => b.onclick = showSetup)
 // ---------- phone ----------
 function startPhone() {
   $('phone').classList.remove('hidden');
-  let pending = null, timer = null;
+  const btn = $('snapBtn');
+  let pending = null, timer = null;   // in-flight solve request
+  const newId = () => Math.random().toString(36).slice(2, 8);
 
   const setAnswer = (t) => renderSolution($('answer'), t, true);
   const setSolution = (t) => renderSolution($('answer'), t, false);
-  const done = () => { pending = null; clearTimeout(timer); $('snapBtn').disabled = false; };
+  const done = () => { pending = null; clearTimeout(timer); btn.disabled = false; };
+  const setCount = (n) => {
+    $('pagesBar').classList.toggle('hidden', n === 0);
+    $('pagesCount').textContent = n + (n === 1 ? ' page held' : ' pages held') + ' · tap to solve';
+  };
 
   listen((m) => {
-    if (!pending) return;
-    if (m.startsWith('ack:' + pending)) setAnswer('Thinking…');
-    else if (m.startsWith('ans:' + pending + ':')) { setSolution(m.slice(('ans:' + pending + ':').length)); done(); }
-    else if (m.startsWith('err:' + pending + ':')) { setAnswer('Error: ' + m.slice(('err:' + pending + ':').length)); done(); }
+    const [kind, id, ...rest] = m.split(':');
+    const body = rest.join(':');
+    if (kind === 'count') setCount(Number(body) || 0);           // iPad's held-page count changed
+    else if (kind === 'added') { setCount(Number(body) || 0); setAnswer('Page ' + body + ' added'); }
+    if (!pending || id !== pending) return;
+    if (kind === 'ack') setAnswer('Solving ' + body + (body === '1' ? ' page…' : ' pages…'));
+    else if (kind === 'ans') { setSolution(body); done(); }
+    else if (kind === 'err') { setAnswer('Error: ' + body); done(); }
   }, (ok) => { $('phoneStatus').textContent = ok ? 'Connected' : 'Reconnecting…'; });
 
-  $('snapBtn').onclick = async () => {
-    pending = Math.random().toString(36).slice(2, 8);
-    $('snapBtn').disabled = true;
+  async function solve() {
+    pending = newId();
+    btn.disabled = true;
     setAnswer('Sending…');
-    if (navigator.vibrate) navigator.vibrate(30);
     try { await send('snap:' + pending); }
     catch { setAnswer('Network error'); return done(); }
-    timer = setTimeout(() => { setAnswer('No reply from iPad. Is the page open + camera on?'); done(); }, 90000);
+    timer = setTimeout(() => { setAnswer('No reply from iPad. Is the page open + camera on?'); done(); }, 120000);
+  }
+  async function addPage() {
+    setAnswer('Adding page…');
+    try { await send('add:' + newId()); } catch { setAnswer('Network error'); }
+  }
+  $('clearBtn').onclick = async () => {
+    try { await send('clear:' + newId()); setAnswer('Pages cleared'); } catch { setAnswer('Network error'); }
   };
+
+  // One button: tap = snap this page + solve everything; hold = snap this page and keep it.
+  let holdTimer = null, held = false, down = false;
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  btn.addEventListener('pointerdown', (e) => {
+    if (btn.disabled) return;
+    down = true; held = false;
+    try { btn.setPointerCapture(e.pointerId); } catch {}
+    holdTimer = setTimeout(() => {
+      held = true;
+      btn.classList.add('holding');
+      if (navigator.vibrate) navigator.vibrate(40);
+      addPage();
+    }, 400);
+  });
+  btn.addEventListener('pointerup', () => {
+    if (!down) return;
+    down = false;
+    clearTimeout(holdTimer);
+    btn.classList.remove('holding');
+    if (!held && !btn.disabled) solve();
+  });
+  btn.addEventListener('pointercancel', () => {
+    down = false; clearTimeout(holdTimer); btn.classList.remove('holding');
+  });
 }
 
 // ---------- iPad ----------
-const SYSTEM = `You are looking at a photo of a question (homework, worksheet, screen, etc).
+const SYSTEM = `You are looking at one or more photos of a question (homework, worksheet, screen, etc).
+If there are several photos, they are consecutive pages of the same question, in order: combine them.
 Read the question carefully and solve it.
 Reply ONLY in this format, nothing before or after:
 1. <first step>
@@ -244,7 +305,14 @@ Rules:
 - If multiple questions are visible, solve the most prominent one.
 - If there is no readable question, reply only: ANSWER: No question found.`;
 
-async function askClaude(base64jpeg) {
+async function askClaude(images) {
+  const content = [];
+  images.forEach((data, i) => {
+    if (images.length > 1) content.push({ type: 'text', text: `Page ${i + 1} of ${images.length}:` });
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } });
+  });
+  content.push({ type: 'text', text: images.length > 1 ? 'Solve the question across these pages.' : 'Solve the question in this photo.' });
+
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -257,13 +325,7 @@ async function askClaude(base64jpeg) {
       model: store.get('model') || 'claude-sonnet-5-5',
       max_tokens: 16000,
       system: SYSTEM,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64jpeg } },
-          { type: 'text', text: 'Solve the question in this photo.' },
-        ],
-      }],
+      messages: [{ role: 'user', content }],
     }),
   });
   const data = await res.json();
@@ -316,26 +378,73 @@ function startIpad() {
     return url.split(',')[1];
   }
 
-  async function handle(id, reply) {
+  const MAX_PAGES = 10;
+  let pages = [];  // held pages (base64 JPEG), sent together on the next solve
+
+  function showHeld() {
+    const box = $('heldThumbs');
+    box.replaceChildren();
+    pages.forEach((p) => {
+      const img = document.createElement('img');
+      img.src = 'data:image/jpeg;base64,' + p;
+      img.style.cssText = 'height:70px;border-radius:6px;border:2px solid #f0a020';
+      box.appendChild(img);
+    });
+  }
+
+  // Hold on phone: capture one page and keep it.
+  async function handleAdd(id, reply) {
+    if (busy) return reply && send('err:' + id + ':Busy solving, wait');
+    try {
+      if (pages.length >= MAX_PAGES) throw new Error('Max ' + MAX_PAGES + ' pages');
+      pages.push(capture());
+      showHeld();
+      status(pages.length + ' page(s) held. Hold again for more, tap to solve.');
+      reply && await send('added:' + id + ':' + pages.length);
+    } catch (e) {
+      status('Error: ' + e.message);
+      reply && send('err:' + id + ':' + e.message);
+    }
+  }
+
+  // Tap on phone: capture this page, then solve all held pages + this one.
+  async function handleSolve(id, reply) {
     if (busy) return reply && send('err:' + id + ':Busy, try again');
     busy = true;
+    const held = pages;
     try {
-      reply && send('ack:' + id);
-      status('Snapped. Asking Claude…');
-      const img = capture();
-      const ans = await askClaude(img);
+      const imgs = [...held, capture()];
+      pages = []; showHeld();
+      reply && send('ack:' + id + ':' + imgs.length);
+      status('Asking Claude about ' + imgs.length + ' page(s)…');
+      const ans = await askClaude(imgs);
       renderSolution($('ipadAnswer'), ans, false);
       status('Done. Waiting for phone…');
       reply && await send('ans:' + id + ':' + ans);
     } catch (e) {
+      pages = held; showHeld();  // keep earlier pages so a retry doesn't lose them
       status('Error: ' + e.message);
       reply && send('err:' + id + ':' + e.message);
-    } finally { busy = false; }
+    } finally {
+      busy = false;
+      reply && send('count:' + id + ':' + pages.length);
+    }
   }
 
-  $('testSnap').onclick = () => handle('local', false);
+  async function handleClear(id, reply) {
+    if (busy) return;
+    pages = []; showHeld();
+    status('Pages cleared. Waiting for phone…');
+    reply && send('count:' + id + ':0');
+  }
+
+  $('testAdd').onclick = () => handleAdd('local', false);
+  $('testSnap').onclick = () => handleSolve('local', false);
   listen((m) => {
-    if (m.startsWith('snap:')) handle(m.slice(5), true);
+    const [kind, id] = m.split(':');
+    if (kind === 'snap') handleSolve(id, true);
+    else if (kind === 'add') handleAdd(id, true);
+    else if (kind === 'clear') handleClear(id, true);
   }, (ok) => { if (!ok) status('Relay reconnecting…'); });
 
   startCamera();
