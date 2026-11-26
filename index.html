@@ -37,10 +37,14 @@
     font-size: 19px; line-height: 1.4; padding: 16px; border-radius: 16px; background: #1a1a1a;
     word-break: break-word; min-height: 160px;
   }
-  .line { padding: 6px 0; border-bottom: 1px solid #262626; }
-  .line:last-child { border-bottom: 0; }
-  .line.final { font-size: 26px; font-weight: 700; color: #7fd18b; padding-top: 12px; }
-  .line.msg { text-align: center; font-size: 24px; font-weight: 600; padding-top: 40px; border: 0; }
+  .line.msg { text-align: center; font-size: 24px; font-weight: 600; padding-top: 40px; }
+  .ans {
+    display: flex; gap: 14px; align-items: baseline;
+    padding: 10px 2px; border-bottom: 1px solid #2a2a2a;
+  }
+  .ans:last-child { border-bottom: 0; }
+  .ans .q { flex: 0 0 auto; min-width: 2.2em; color: #888; font-weight: 600; font-size: 18px; }
+  .ans .a { flex: 1; font-size: 24px; font-weight: 700; color: #7fd18b; }
   #snapBtn {
     width: 100%; height: 22vh; font-size: 34px; border-radius: 24px; flex-shrink: 0;
     -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
@@ -137,25 +141,48 @@ const store = {
 };
 const RELAY = 'https://ntfy.sh/';
 
-// Render a multi-line solution: one step per line, final "ANSWER:" line highlighted.
-function renderSolution(el, text, isMsg) {
+// Status message (centered, one line).
+function renderMsg(el, text) {
   el.replaceChildren();
-  const lines = isMsg ? [text] : text.split('\n').map(s => s.trim()).filter(Boolean);
-  for (const l of lines) {
-    const d = document.createElement('div');
-    d.className = 'line' + (isMsg ? ' msg' : /^ANSWER:/i.test(l) ? ' final' : '');
-    d.textContent = l;
-    el.appendChild(d);
+  const d = document.createElement('div');
+  d.className = 'line msg';
+  d.textContent = text;
+  el.appendChild(d);
+}
+
+// Answer list: one row per answer, question label on the left, answer on the right.
+// `answers` is [{q, a}] or a raw string (fallback: one row per line).
+function renderAnswers(el, answers) {
+  el.replaceChildren();
+  if (typeof answers === 'string') {
+    answers = answers.split('\n').map(s => s.trim()).filter(Boolean).map(a => ({ q: '', a }));
+  }
+  if (!answers.length) return renderMsg(el, 'No question found');
+  for (const { q, a } of answers) {
+    const row = document.createElement('div');
+    row.className = 'ans';
+    const label = document.createElement('span');
+    label.className = 'q';
+    label.textContent = q || '•';
+    const val = document.createElement('span');
+    val.className = 'a';
+    val.textContent = a;
+    row.append(label, val);
+    el.appendChild(row);
   }
   el.scrollTop = 0;
 }
 
-// ntfy.sh turns messages over 4096 bytes into attachments, so keep under that.
-function fitBytes(s, max) {
+// ntfy.sh turns messages over 4096 bytes into attachments, so drop trailing answers to fit.
+function encodeAnswers(answers, maxBytes) {
   const enc = new TextEncoder();
-  if (enc.encode(s).length <= max) return s;
-  while (enc.encode(s + '…').length > max) s = s.slice(0, -1);
-  return s + '…';
+  let list = answers.slice();
+  let s = JSON.stringify(list);
+  while (enc.encode(s).length > maxBytes && list.length > 1) {
+    list = list.slice(0, -1);
+    s = JSON.stringify([...list, { q: '…', a: 'more answers on iPad' }]);
+  }
+  return s;
 }
 
 function randomCode() {
@@ -228,8 +255,12 @@ function startPhone() {
   let pending = null, timer = null;   // in-flight solve request
   const newId = () => Math.random().toString(36).slice(2, 8);
 
-  const setAnswer = (t) => renderSolution($('answer'), t, true);
-  const setSolution = (t) => renderSolution($('answer'), t, false);
+  const setAnswer = (t) => renderMsg($('answer'), t);
+  const setSolution = (body) => {
+    let list;
+    try { list = JSON.parse(body); } catch { list = body; }
+    renderAnswers($('answer'), Array.isArray(list) ? list : String(list));
+  };
   const done = () => { pending = null; clearTimeout(timer); btn.disabled = false; };
   const setCount = (n) => {
     $('pagesBar').classList.toggle('hidden', n === 0);
@@ -290,20 +321,32 @@ function startPhone() {
 }
 
 // ---------- iPad ----------
-const SYSTEM = `You are looking at one or more photos of a question (homework, worksheet, screen, etc).
-If there are several photos, they are consecutive pages of the same question, in order: combine them.
-Read the question carefully and solve it.
-Reply ONLY in this format, nothing before or after:
-1. <first step>
-2. <second step>
-...
-ANSWER: <the final answer>
-Rules:
-- One step or decision per line. Keep each line short (under ~15 words).
-- List every step needed, in order. Simple questions may need only one step.
-- Plain text only: no markdown, no bold, no LaTeX. Write math like x^2, sqrt(3), 3/4.
-- If multiple questions are visible, solve the most prominent one.
-- If there is no readable question, reply only: ANSWER: No question found.`;
+const SYSTEM = `You are looking at one or more photos of questions (homework, worksheet, screen, etc).
+If there are several photos, they are consecutive pages, in order: treat them as one document.
+Solve every question visible and return ONLY the final answers.
+- One list item per answer. Each sub-part (a, b, c...) or each blank is its own item.
+- "q": the question label exactly as printed (e.g. "1", "2b", "Q3"). If unlabeled, number them "1", "2", ...
+- "a": the final answer only. No explanation, no steps, no restating the question. As short as possible.
+- Multiple choice: the letter plus a few words of the choice, e.g. "C - 42 m/s".
+- Plain text only: no markdown, no LaTeX. Write math like x^2, sqrt(3), 3/4.
+- If there is no readable question, return an empty list.`;
+
+const ANSWER_SCHEMA = {
+  type: 'object',
+  properties: {
+    answers: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { q: { type: 'string' }, a: { type: 'string' } },
+        required: ['q', 'a'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['answers'],
+  additionalProperties: false,
+};
 
 async function askClaude(images) {
   const content = [];
@@ -326,17 +369,19 @@ async function askClaude(images) {
       max_tokens: 16000,
       system: SYSTEM,
       messages: [{ role: 'user', content }],
+      output_config: { format: { type: 'json_schema', schema: ANSWER_SCHEMA } },
     }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
   const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-  if (!text) return 'ANSWER: (empty reply)';
-  // Drop any preamble before the first numbered step / ANSWER line.
-  const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
-  const start = lines.findIndex(l => /^(\d+[.)]|ANSWER:)/i.test(l));
-  const out = (start > 0 ? lines.slice(start) : lines).join('\n');
-  return fitBytes(out, 3800);
+  if (data.stop_reason === 'refusal') throw new Error('Claude declined this one');
+  try {
+    const list = JSON.parse(text).answers;
+    if (Array.isArray(list)) return list.map(x => ({ q: String(x.q ?? ''), a: String(x.a ?? '') }));
+  } catch {}
+  // Fallback: one answer per non-empty line.
+  return text.split('\n').map(s => s.trim()).filter(Boolean).map(a => ({ q: '', a }));
 }
 
 function startIpad() {
@@ -418,9 +463,9 @@ function startIpad() {
       reply && send('ack:' + id + ':' + imgs.length);
       status('Asking Claude about ' + imgs.length + ' page(s)…');
       const ans = await askClaude(imgs);
-      renderSolution($('ipadAnswer'), ans, false);
+      renderAnswers($('ipadAnswer'), ans);
       status('Done. Waiting for phone…');
-      reply && await send('ans:' + id + ':' + ans);
+      reply && await send('ans:' + id + ':' + encodeAnswers(ans, 3800));
     } catch (e) {
       pages = held; showHeld();  // keep earlier pages so a retry doesn't lose them
       status('Error: ' + e.message);
