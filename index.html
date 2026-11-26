@@ -44,7 +44,17 @@
   }
   .ans:last-child { border-bottom: 0; }
   .ans .q { flex: 0 0 auto; min-width: 2.2em; color: #888; font-weight: 600; font-size: 18px; }
-  .ans .a { flex: 1; font-size: 24px; font-weight: 700; color: #7fd18b; }
+  .ans .body { flex: 1; min-width: 0; }
+  .ans .a { font-size: 24px; font-weight: 700; color: #7fd18b; }
+  .ans .a.lift { color: #5fd38a; }
+  .ans .a.hit { color: #ff7a6b; }
+  .ans .why { font-size: 14px; color: #8a8a8a; margin-top: 3px; }
+  #modeSel {
+    position: fixed; top: 10px; right: 10px; z-index: 6; width: auto;
+    padding: 8px 12px; font-size: 15px; font-weight: 600; border-radius: 10px;
+  }
+  #phone .gear { right: auto; left: 10px; }
+  #phone { padding-top: 60px; }
   #snapBtn {
     width: 100%; height: 22vh; font-size: 34px; border-radius: 24px; flex-shrink: 0;
     -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
@@ -105,6 +115,12 @@
 <!-- PHONE -->
 <div id="phone" class="hidden">
   <button class="gear secondary" data-settings>⚙︎</button>
+  <select id="modeSel" aria-label="Question type">
+    <option value="general">General</option>
+    <option value="likelihood">Likelihood</option>
+    <option value="interval">Interval</option>
+    <option value="orderbook">Order book</option>
+  </select>
   <div id="answer"><div class="line msg">Ready</div></div>
   <div id="pagesBar" class="hidden">
     <span id="pagesCount"></span>
@@ -158,16 +174,25 @@ function renderAnswers(el, answers) {
     answers = answers.split('\n').map(s => s.trim()).filter(Boolean).map(a => ({ q: '', a }));
   }
   if (!answers.length) return renderMsg(el, 'No question found');
-  for (const { q, a } of answers) {
+  for (const { q, a, why } of answers) {
     const row = document.createElement('div');
     row.className = 'ans';
     const label = document.createElement('span');
     label.className = 'q';
     label.textContent = q || '•';
-    const val = document.createElement('span');
-    val.className = 'a';
+    const body = document.createElement('div');
+    body.className = 'body';
+    const val = document.createElement('div');
+    val.className = 'a' + (/^lift\b/i.test(a) ? ' lift' : /^hit\b/i.test(a) ? ' hit' : '');
     val.textContent = a;
-    row.append(label, val);
+    body.appendChild(val);
+    if (why) {
+      const w = document.createElement('div');
+      w.className = 'why';
+      w.textContent = why;
+      body.appendChild(w);
+    }
+    row.append(label, body);
     el.appendChild(row);
   }
   el.scrollTop = 0;
@@ -252,6 +277,8 @@ document.querySelectorAll('[data-settings]').forEach(b => b.onclick = showSetup)
 function startPhone() {
   $('phone').classList.remove('hidden');
   const btn = $('snapBtn');
+  $('modeSel').value = store.get('mode') || 'general';
+  $('modeSel').onchange = () => store.set('mode', $('modeSel').value);
   let pending = null, timer = null;   // in-flight solve request
   const newId = () => Math.random().toString(36).slice(2, 8);
 
@@ -282,7 +309,7 @@ function startPhone() {
     pending = newId();
     btn.disabled = true;
     setAnswer('Sending…');
-    try { await send('snap:' + pending); }
+    try { await send('snap:' + pending + ':' + $('modeSel').value); }
     catch { setAnswer('Network error'); return done(); }
     timer = setTimeout(() => { setAnswer('No reply from iPad. Is the page open + camera on?'); done(); }, 120000);
   }
@@ -321,15 +348,46 @@ function startPhone() {
 }
 
 // ---------- iPad ----------
-const SYSTEM = `You are looking at one or more photos of questions (homework, worksheet, screen, etc).
+// Shared rules, then one block per question type (picked from the phone's dropdown).
+const BASE = `You are looking at one or more photos of practice questions.
 If there are several photos, they are consecutive pages, in order: treat them as one document.
-Solve every question visible and return ONLY the final answers.
-- One list item per answer. Each sub-part (a, b, c...) or each blank is its own item.
-- "q": the question label exactly as printed (e.g. "1", "2b", "Q3"). If unlabeled, number them "1", "2", ...
-- "a": the final answer only. No explanation, no steps, no restating the question. As short as possible.
-- Multiple choice: the letter plus a few words of the choice, e.g. "C - 42 m/s".
-- Plain text only: no markdown, no LaTeX. Write math like x^2, sqrt(3), 3/4.
-- If there is no readable question, return an empty list.`;
+Return a list of items. Each item has:
+- "q": a short label (rules below).
+- "a": the answer, as short as possible, plain text, no markdown or LaTeX (write x^2, sqrt(3), 3/4).
+- "why": ONE short reason, max 12 words, so the student can learn from it.
+If there is no readable question, return an empty list.`;
+
+const PROMPTS = {
+  general: `${BASE}
+Type: general questions.
+- Solve every visible question. One item per answer; each sub-part (a, b, c) or blank is its own item.
+- "q": the question label as printed ("1", "2b", "Q3"); if unlabeled number them "1", "2", ...
+- "a": final answer only. Multiple choice: letter plus a few words, e.g. "C - 42 m/s".`,
+
+  likelihood: `${BASE}
+Type: likelihood ranking. Each question shows several statements/events to rank from MOST likely to LEAST likely.
+- Output one item per statement, ordered from most likely to least likely.
+- "q": the rank: "1" for most likely, then "2", "3", ...
+- "a": the FIRST 5 WORDS of that statement, copied exactly as written (fewer if the statement is shorter). No ellipsis.
+- "why": rough probability or key reason, e.g. "~1/6, single die roll".
+- If several separate ranking questions are visible, prefix "q" with the question number, e.g. "Q2-1", "Q2-2".`,
+
+  interval: `${BASE}
+Type: interval estimation. Each question asks for a range (low to high) likely to contain a true value.
+- One item per question.
+- "q": the question label as printed; if unlabeled "1", "2", ...
+- "a": ONE line: "<low> - <high> <unit>", e.g. "8,000 - 12,000 km". Center on your best estimate; make the range about a 90% confidence interval unless the question states a different confidence.
+- "why": your point estimate and the basis, e.g. "best guess ~10,000 km, Earth diameter ~12,700".`,
+
+  orderbook: `${BASE}
+Type: order book trading. The photo shows contracts with bid and ask prices (and possibly a fair value or information to compute it).
+- For each contract, compare the market to fair value: LIFT (buy at the ask) if ask < fair value; HIT (sell at the bid) if bid > fair value. Skip contracts with no edge.
+- One item per trade, ordered by largest edge first.
+- "q": empty string "".
+- "a": exactly "Lift <contract> @ <ask>" or "Hit <contract> @ <bid>", e.g. "Lift Dec Call @ 4.20".
+- "why": fair value and edge, e.g. "fair 4.80, edge +0.60".
+- If no trade has edge, return one item with "a": "No trades" and why explaining.`,
+};
 
 const ANSWER_SCHEMA = {
   type: 'object',
@@ -338,8 +396,8 @@ const ANSWER_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { q: { type: 'string' }, a: { type: 'string' } },
-        required: ['q', 'a'],
+        properties: { q: { type: 'string' }, a: { type: 'string' }, why: { type: 'string' } },
+        required: ['q', 'a', 'why'],
         additionalProperties: false,
       },
     },
@@ -348,7 +406,8 @@ const ANSWER_SCHEMA = {
   additionalProperties: false,
 };
 
-async function askClaude(images) {
+async function askClaude(images, mode) {
+  const system = PROMPTS[mode] || PROMPTS.general;
   const content = [];
   images.forEach((data, i) => {
     if (images.length > 1) content.push({ type: 'text', text: `Page ${i + 1} of ${images.length}:` });
@@ -367,7 +426,7 @@ async function askClaude(images) {
     body: JSON.stringify({
       model: store.get('model') || 'claude-sonnet-5-5',
       max_tokens: 16000,
-      system: SYSTEM,
+      system,
       messages: [{ role: 'user', content }],
       output_config: { format: { type: 'json_schema', schema: ANSWER_SCHEMA } },
     }),
@@ -378,7 +437,7 @@ async function askClaude(images) {
   if (data.stop_reason === 'refusal') throw new Error('Claude declined this one');
   try {
     const list = JSON.parse(text).answers;
-    if (Array.isArray(list)) return list.map(x => ({ q: String(x.q ?? ''), a: String(x.a ?? '') }));
+    if (Array.isArray(list)) return list.map(x => ({ q: String(x.q ?? ''), a: String(x.a ?? ''), why: String(x.why ?? '') }));
   } catch {}
   // Fallback: one answer per non-empty line.
   return text.split('\n').map(s => s.trim()).filter(Boolean).map(a => ({ q: '', a }));
@@ -453,7 +512,7 @@ function startIpad() {
   }
 
   // Tap on phone: capture this page, then solve all held pages + this one.
-  async function handleSolve(id, reply) {
+  async function handleSolve(id, reply, mode = 'general') {
     if (busy) return reply && send('err:' + id + ':Busy, try again');
     busy = true;
     const held = pages;
@@ -462,7 +521,7 @@ function startIpad() {
       pages = []; showHeld();
       reply && send('ack:' + id + ':' + imgs.length);
       status('Asking Claude about ' + imgs.length + ' page(s)…');
-      const ans = await askClaude(imgs);
+      const ans = await askClaude(imgs, mode);
       renderAnswers($('ipadAnswer'), ans);
       status('Done. Waiting for phone…');
       reply && await send('ans:' + id + ':' + encodeAnswers(ans, 3800));
@@ -486,8 +545,8 @@ function startIpad() {
   $('testAdd').onclick = () => handleAdd('local', false);
   $('testSnap').onclick = () => handleSolve('local', false);
   listen((m) => {
-    const [kind, id] = m.split(':');
-    if (kind === 'snap') handleSolve(id, true);
+    const [kind, id, mode] = m.split(':');
+    if (kind === 'snap') handleSolve(id, true, PROMPTS[mode] ? mode : 'general');
     else if (kind === 'add') handleAdd(id, true);
     else if (kind === 'clear') handleClear(id, true);
   }, (ok) => { if (!ok) status('Relay reconnecting…'); });
