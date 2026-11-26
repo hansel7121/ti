@@ -48,7 +48,9 @@
   .ans .a { font-size: 24px; font-weight: 700; color: #7fd18b; }
   .ans .a.lift { color: #5fd38a; }
   .ans .a.hit { color: #ff7a6b; }
-  .ans .why { font-size: 14px; color: #8a8a8a; margin-top: 3px; }
+  .ans .rest { font-size: 16px; color: #b0b0b0; margin-top: 2px; }
+  .ans .rest.actual { color: #f0c060; font-weight: 600; }
+  .ans .why { font-size: 13px; color: #777; margin-top: 3px; font-style: italic; }
   #modeSel {
     position: fixed; top: 10px; right: 10px; z-index: 6; width: auto;
     padding: 8px 12px; font-size: 15px; font-weight: 600; border-radius: 10px;
@@ -174,7 +176,7 @@ function renderAnswers(el, answers) {
     answers = answers.split('\n').map(s => s.trim()).filter(Boolean).map(a => ({ q: '', a }));
   }
   if (!answers.length) return renderMsg(el, 'No question found');
-  for (const { q, a, why } of answers) {
+  for (const { q, a, rest, why } of answers) {
     const row = document.createElement('div');
     row.className = 'ans';
     const label = document.createElement('span');
@@ -186,6 +188,12 @@ function renderAnswers(el, answers) {
     val.className = 'a' + (/^lift\b/i.test(a) ? ' lift' : /^hit\b/i.test(a) ? ' hit' : '');
     val.textContent = a;
     body.appendChild(val);
+    if (rest) {
+      const r = document.createElement('div');
+      r.className = 'rest' + (/^actual:/i.test(rest) ? ' actual' : '');
+      r.textContent = rest;
+      body.appendChild(r);
+    }
     if (why) {
       const w = document.createElement('div');
       w.className = 'why';
@@ -354,6 +362,7 @@ If there are several photos, they are consecutive pages, in order: treat them as
 Return a list of items. Each item has:
 - "q": a short label (rules below).
 - "a": the answer, as short as possible, plain text, no markdown or LaTeX (write x^2, sqrt(3), 3/4).
+- "rest": "" (empty) unless the type rules below say otherwise.
 - "why": ONE short reason, max 12 words, so the student can learn from it.
 If there is no readable question, return an empty list.`;
 
@@ -369,6 +378,7 @@ Type: likelihood ranking. Each question shows several statements/events to rank 
 - Output one item per statement, ordered from most likely to least likely.
 - "q": the rank: "1" for most likely, then "2", "3", ...
 - "a": the FIRST 5 WORDS of that statement, copied exactly as written (fewer if the statement is shorter). No ellipsis.
+- "rest": the REST of that statement after those 5 words, copied exactly as written ("" if nothing remains).
 - "why": rough probability or key reason, e.g. "~1/6, single die roll".
 - If several separate ranking questions are visible, prefix "q" with the question number, e.g. "Q2-1", "Q2-2".`,
 
@@ -377,6 +387,7 @@ Type: interval estimation. Each question asks for a range (low to high) likely t
 - One item per question.
 - "q": the question label as printed; if unlabeled "1", "2", ...
 - "a": ONE line: "<low> - <high> <unit>", e.g. "8,000 - 12,000 km". Center on your best estimate; make the range about a 90% confidence interval unless the question states a different confidence.
+- "rest": if the question has a factual true answer you know, exactly "Actual: <value> <unit>", e.g. "Actual: 12,742 km". Use the most accurate figure you know; add "(approx)" if unsure of exact value. If there is no knowable true answer, "".
 - "why": your point estimate and the basis, e.g. "best guess ~10,000 km, Earth diameter ~12,700".`,
 
   orderbook: `${BASE}
@@ -396,8 +407,8 @@ const ANSWER_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { q: { type: 'string' }, a: { type: 'string' }, why: { type: 'string' } },
-        required: ['q', 'a', 'why'],
+        properties: { q: { type: 'string' }, a: { type: 'string' }, rest: { type: 'string' }, why: { type: 'string' } },
+        required: ['q', 'a', 'rest', 'why'],
         additionalProperties: false,
       },
     },
@@ -437,7 +448,7 @@ async function askClaude(images, mode) {
   if (data.stop_reason === 'refusal') throw new Error('Claude declined this one');
   try {
     const list = JSON.parse(text).answers;
-    if (Array.isArray(list)) return list.map(x => ({ q: String(x.q ?? ''), a: String(x.a ?? ''), why: String(x.why ?? '') }));
+    if (Array.isArray(list)) return list.map(x => ({ q: String(x.q ?? ''), a: String(x.a ?? ''), rest: String(x.rest ?? ''), why: String(x.why ?? '') }));
   } catch {}
   // Fallback: one answer per non-empty line.
   return text.split('\n').map(s => s.trim()).filter(Boolean).map(a => ({ q: '', a }));
