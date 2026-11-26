@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Snap Solve</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; font-family: -apple-system, system-ui, sans-serif;
+    background: #111; color: #eee; display: flex; flex-direction: column;
+  }
+  .wrap { padding: 20px; max-width: 640px; margin: 0 auto; width: 100%; }
+  h1 { font-size: 22px; margin: 0 0 16px; }
+  label { display: block; margin: 14px 0 6px; font-size: 14px; color: #aaa; }
+  input, select {
+    width: 100%; padding: 12px; font-size: 16px; border-radius: 10px;
+    border: 1px solid #333; background: #1c1c1c; color: #eee;
+  }
+  button {
+    font-size: 17px; padding: 14px 18px; border-radius: 12px; border: 0;
+    background: #3a7afe; color: #fff; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: #2a2a2a; }
+  .row { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+  .row > * { flex: 1; }
+  .hidden { display: none !important; }
+  .small { font-size: 13px; color: #888; margin-top: 8px; }
+  #status { font-size: 14px; color: #aaa; margin: 10px 0; min-height: 20px; }
+
+  /* Phone */
+  #phone { flex: 1; display: flex; flex-direction: column; padding: 20px; gap: 20px; }
+  #answer {
+    flex: 1; display: flex; align-items: center; justify-content: center; text-align: center;
+    font-size: 28px; font-weight: 600; padding: 16px; border-radius: 16px; background: #1a1a1a;
+    word-break: break-word; min-height: 160px;
+  }
+  #snapBtn { width: 100%; height: 34vh; font-size: 34px; border-radius: 24px; }
+  #snapBtn:disabled { background: #444; }
+
+  /* iPad */
+  #ipad { flex: 1; display: flex; flex-direction: column; padding: 16px; gap: 12px; }
+  video { width: 100%; max-height: 70vh; background: #000; border-radius: 12px; object-fit: contain; }
+  #lastShot { max-width: 220px; border-radius: 8px; }
+  #ipadAnswer { font-size: 20px; }
+  .gear { position: fixed; top: 10px; right: 10px; background: #222; padding: 8px 12px; font-size: 14px; z-index: 5; }
+</style>
+</head>
+<body>
+
+<!-- SETUP -->
+<div id="setup" class="wrap hidden">
+  <h1>Snap Solve setup</h1>
+
+  <label>This device is the…</label>
+  <select id="role">
+    <option value="phone">Phone (button + answer)</option>
+    <option value="ipad">iPad (camera + Claude)</option>
+  </select>
+
+  <label>Pairing code (must match on both devices)</label>
+  <div class="row" style="margin-top:0">
+    <input id="code" autocomplete="off" autocapitalize="off" spellcheck="false" style="flex:3">
+    <button class="secondary" id="genCode" style="flex:1">New</button>
+  </div>
+  <div class="small">Long random code = private channel. Anyone with this code can see your answers.</div>
+
+  <div id="ipadFields">
+    <label>Anthropic API key (stored only on this iPad)</label>
+    <input id="apiKey" type="password" autocomplete="off" placeholder="sk-ant-...">
+    <label>Model</label>
+    <select id="model">
+      <option value="claude-sonnet-5-5">Sonnet 5.5 (fast, cheap)</option>
+      <option value="claude-opus-5-5">Opus 5.5 (smartest, slower)</option>
+      <option value="claude-haiku-5-5">Haiku 5.5 (fastest)</option>
+    </select>
+  </div>
+
+  <div class="row"><button id="saveBtn">Save &amp; start</button></div>
+</div>
+
+<!-- PHONE -->
+<div id="phone" class="hidden">
+  <button class="gear secondary" data-settings>⚙︎</button>
+  <div id="answer">Ready</div>
+  <div id="phoneStatus" class="small" style="text-align:center"></div>
+  <button id="snapBtn">SNAP</button>
+</div>
+
+<!-- IPAD -->
+<div id="ipad" class="hidden">
+  <button class="gear secondary" data-settings>⚙︎</button>
+  <div class="row" style="margin-top:0" id="camStartRow">
+    <button id="camStart">Start camera</button>
+  </div>
+  <video id="video" playsinline muted autoplay></video>
+  <div id="status"></div>
+  <div class="row" style="margin-top:0">
+    <button class="secondary" id="testSnap">Test snap here</button>
+  </div>
+  <img id="lastShot" class="hidden" alt="">
+  <div id="ipadAnswer"></div>
+</div>
+
+<canvas id="canvas" class="hidden"></canvas>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const store = {
+  get: (k) => localStorage.getItem('snapsolve_' + k) || '',
+  set: (k, v) => localStorage.setItem('snapsolve_' + k, v),
+};
+const RELAY = 'https://ntfy.sh/';
+
+function randomCode() {
+  const a = new Uint8Array(18);
+  crypto.getRandomValues(a);
+  return 'ss-' + Array.from(a, b => b.toString(36).padStart(2, '0')).join('').slice(0, 28);
+}
+
+// ---------- relay (ntfy.sh) ----------
+function topic() { return store.get('code'); }
+
+async function send(msg) {
+  await fetch(RELAY + encodeURIComponent(topic()), { method: 'POST', body: msg });
+}
+
+function listen(onMsg, onState) {
+  let es;
+  const connect = () => {
+    es = new EventSource(RELAY + encodeURIComponent(topic()) + '/sse');
+    es.onopen = () => onState && onState(true);
+    es.onerror = () => onState && onState(false); // EventSource auto-reconnects
+    es.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.event === 'message' && typeof d.message === 'string') onMsg(d.message);
+      } catch {}
+    };
+  };
+  connect();
+  // Safari may kill the stream when backgrounded; reconnect on return.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && es.readyState === EventSource.CLOSED) connect();
+  });
+}
+
+// ---------- setup ----------
+function showSetup() {
+  for (const id of ['phone', 'ipad']) $(id).classList.add('hidden');
+  $('setup').classList.remove('hidden');
+  $('role').value = store.get('role') || 'phone';
+  $('code').value = store.get('code') || randomCode();
+  $('apiKey').value = store.get('apiKey');
+  $('model').value = store.get('model') || 'claude-sonnet-5-5';
+  toggleIpadFields();
+}
+function toggleIpadFields() {
+  $('ipadFields').classList.toggle('hidden', $('role').value !== 'ipad');
+}
+$('role').onchange = toggleIpadFields;
+$('genCode').onclick = () => { $('code').value = randomCode(); };
+$('saveBtn').onclick = () => {
+  const code = $('code').value.trim();
+  if (code.length < 12) return alert('Pairing code too short (use 12+ characters).');
+  if ($('role').value === 'ipad' && !$('apiKey').value.trim().startsWith('sk-ant-'))
+    return alert('Enter a valid Anthropic API key.');
+  store.set('role', $('role').value);
+  store.set('code', code);
+  if ($('role').value === 'ipad') {
+    store.set('apiKey', $('apiKey').value.trim());
+    store.set('model', $('model').value);
+  }
+  location.reload();
+};
+document.querySelectorAll('[data-settings]').forEach(b => b.onclick = showSetup);
+
+// ---------- phone ----------
+function startPhone() {
+  $('phone').classList.remove('hidden');
+  let pending = null, timer = null;
+
+  const setAnswer = (t) => { $('answer').textContent = t; };
+  const done = () => { pending = null; clearTimeout(timer); $('snapBtn').disabled = false; };
+
+  listen((m) => {
+    if (!pending) return;
+    if (m.startsWith('ack:' + pending)) setAnswer('Thinking…');
+    else if (m.startsWith('ans:' + pending + ':')) { setAnswer(m.slice(('ans:' + pending + ':').length)); done(); }
+    else if (m.startsWith('err:' + pending + ':')) { setAnswer('Error: ' + m.slice(('err:' + pending + ':').length)); done(); }
+  }, (ok) => { $('phoneStatus').textContent = ok ? 'Connected' : 'Reconnecting…'; });
+
+  $('snapBtn').onclick = async () => {
+    pending = Math.random().toString(36).slice(2, 8);
+    $('snapBtn').disabled = true;
+    setAnswer('Sending…');
+    if (navigator.vibrate) navigator.vibrate(30);
+    try { await send('snap:' + pending); }
+    catch { setAnswer('Network error'); return done(); }
+    timer = setTimeout(() => { setAnswer('No reply from iPad. Is the page open + camera on?'); done(); }, 90000);
+  };
+}
+
+// ---------- iPad ----------
+const SYSTEM = `You are looking at a photo of a question (homework, worksheet, screen, etc).
+Read the question carefully and solve it. Work through it briefly if needed.
+Your FINAL line must be exactly: ANSWER: <the final answer in one short line>
+If multiple questions are visible, answer the most prominent one. If there is no readable question, reply: ANSWER: No question found.`;
+
+async function askClaude(base64jpeg) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': store.get('apiKey'),
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: store.get('model') || 'claude-sonnet-5-5',
+      max_tokens: 4000,
+      system: SYSTEM,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64jpeg } },
+          { type: 'text', text: 'Solve the question in this photo.' },
+        ],
+      }],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || ('HTTP ' + res.status));
+  const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+  const m = text.match(/ANSWER:\s*(.+)\s*$/i) || text.match(/ANSWER:\s*(.+)/i);
+  return (m ? m[1] : text.split('\n').filter(Boolean).pop() || '(empty)').trim().slice(0, 1000);
+}
+
+function startIpad() {
+  $('ipad').classList.remove('hidden');
+  const video = $('video');
+  let busy = false;
+  const status = (t) => { $('status').textContent = t; };
+
+  async function startCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1440 } },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      $('camStartRow').classList.add('hidden');
+      status('Camera on. Waiting for phone…');
+      try { await navigator.wakeLock?.request('screen'); } catch {}
+    } catch (e) {
+      status('Camera error: ' + e.message);
+    }
+  }
+  $('camStart').onclick = startCamera;
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible') { try { await navigator.wakeLock?.request('screen'); } catch {} }
+  });
+
+  function capture() {
+    if (!video.videoWidth) throw new Error('Camera not started');
+    const max = 1568; // Claude's sweet spot for image size
+    const scale = Math.min(1, max / Math.max(video.videoWidth, video.videoHeight));
+    const c = $('canvas');
+    c.width = Math.round(video.videoWidth * scale);
+    c.height = Math.round(video.videoHeight * scale);
+    c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+    const url = c.toDataURL('image/jpeg', 0.85);
+    $('lastShot').src = url; $('lastShot').classList.remove('hidden');
+    return url.split(',')[1];
+  }
+
+  async function handle(id, reply) {
+    if (busy) return reply && send('err:' + id + ':Busy, try again');
+    busy = true;
+    try {
+      reply && send('ack:' + id);
+      status('Snapped. Asking Claude…');
+      const img = capture();
+      const ans = await askClaude(img);
+      $('ipadAnswer').textContent = ans;
+      status('Done. Waiting for phone…');
+      reply && await send('ans:' + id + ':' + ans);
+    } catch (e) {
+      status('Error: ' + e.message);
+      reply && send('err:' + id + ':' + e.message);
+    } finally { busy = false; }
+  }
+
+  $('testSnap').onclick = () => handle('local', false);
+  listen((m) => {
+    if (m.startsWith('snap:')) handle(m.slice(5), true);
+  }, (ok) => { if (!ok) status('Relay reconnecting…'); });
+
+  startCamera();
+}
+
+// ---------- boot ----------
+const role = store.get('role');
+if (!role || !store.get('code') || (role === 'ipad' && !store.get('apiKey'))) showSetup();
+else if (role === 'ipad') startIpad();
+else startPhone();
+</script>
+</body>
+</html>
